@@ -1,212 +1,186 @@
-/*
- * cobox — ST7789 SPI LCD + LVGL via esp_lvgl_port
- *
- * Wiring (module pin → ESP32):
- *   GND - Ground
- *   VCC - 3.3V
- *   SCL - GPIO18
- *   SDA - GPIO23
- *   RST - GPIO15
- *   DC  - GPIO2
- *   BLK - GPIO4
- *
- * CS is not wired (tied low on many modules) → GPIO_NUM_NC
- */
-
 #include <stdio.h>
-#include <string.h>
+
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_check.h"
-#include "esp_heap_caps.h"
-#include "driver/gpio.h"
-#include "driver/spi_master.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_st7789.h"
-#include "esp_lvgl_port.h"
+
+#include "display.h"
+#include "buttons.h"
+#include "led.h"
 #include "lvgl.h"
 
 static const char *TAG = "cobox";
 
-/* Matches working Rust/mipidsi setup: 240x240 ST7789 */
-#define LCD_H_RES               240
-#define LCD_V_RES               240
+typedef struct {
+    lv_obj_t *title;
+    lv_obj_t *led_label;
+    lv_obj_t *raw_label;
+    lv_obj_t *hint;
+    lv_obj_t *btn_labels[BTN_COUNT];
+    led_color_t color;
+    bool led_on;
+} ui_t;
 
-#define LCD_SPI_HOST            SPI2_HOST
-#define LCD_PIXEL_CLOCK_HZ      (26 * 1000 * 1000)
-#define LCD_CMD_BITS            8
-#define LCD_PARAM_BITS          8
-#define LCD_BITS_PER_PIXEL      16
-#define LCD_DRAW_BUFF_HEIGHT    40
+static ui_t s_ui;
 
-/* Rust used backlight.set_high() */
-#define LCD_BL_ON_LEVEL         1
-
-/* Pins from your wiring */
-#define PIN_LCD_SCLK            GPIO_NUM_18
-#define PIN_LCD_MOSI            GPIO_NUM_23
-#define PIN_LCD_RST             GPIO_NUM_15
-#define PIN_LCD_DC              GPIO_NUM_2
-#define PIN_LCD_CS              GPIO_NUM_NC
-#define PIN_LCD_BL              GPIO_NUM_4
-
-static esp_lcd_panel_io_handle_t lcd_io = NULL;
-static esp_lcd_panel_handle_t lcd_panel = NULL;
-static lv_display_t *lvgl_disp = NULL;
-
-static void backlight_on(void)
+static void ui_refresh_raw(void)
 {
-    gpio_set_level(PIN_LCD_BL, LCD_BL_ON_LEVEL);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "raw B%d S%d Sel%d",
+             buttons_gpio_level(BTN_BACK),
+             buttons_gpio_level(BTN_SWITCH),
+             buttons_gpio_level(BTN_SELECT));
+
+    if (display_lock(50)) {
+        lv_label_set_text(s_ui.raw_label, buf);
+        display_unlock();
+    }
 }
 
-static void backlight_init(void)
+static void raw_monitor_task(void *arg)
 {
-    const gpio_config_t bk_gpio_config = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << PIN_LCD_BL,
-    };
-    ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
-    /* On immediately so a dark panel isn't mistaken for a driver failure */
-    backlight_on();
+    (void)arg;
+    while (1) {
+        ui_refresh_raw();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
-/* Solid fill via esp_lcd — proves SPI + panel before LVGL */
-static void lcd_fill_color(uint16_t rgb565)
+static void ui_refresh_led(void)
 {
-    const size_t line_pixels = LCD_H_RES;
-    uint16_t *line = heap_caps_malloc(line_pixels * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (!line) {
-        ESP_LOGE(TAG, "fill alloc failed");
+    char buf[48];
+    if (s_ui.led_on) {
+        snprintf(buf, sizeof(buf), "LED: %s", led_color_name(s_ui.color));
+        led_set_color(s_ui.color);
+    } else {
+        snprintf(buf, sizeof(buf), "LED: Off");
+        led_off();
+    }
+
+    if (display_lock(50)) {
+        lv_label_set_text(s_ui.led_label, buf);
+        display_unlock();
+    }
+}
+
+static void ui_refresh_button(button_id_t id, bool pressed)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s: %s", buttons_name(id), pressed ? "DOWN" : "up");
+
+    if (display_lock(50)) {
+        lv_label_set_text(s_ui.btn_labels[id], buf);
+        display_unlock();
+    }
+}
+
+static void on_button(const button_event_t *event, void *user_data)
+{
+    (void)user_data;
+
+    ui_refresh_button(event->id, event->type == BTN_EVENT_PRESSED);
+
+    if (event->type != BTN_EVENT_PRESSED) {
         return;
     }
 
-    /* SPI panels expect big-endian RGB565 */
-    const uint16_t be = (uint16_t)((rgb565 << 8) | (rgb565 >> 8));
-    for (size_t i = 0; i < line_pixels; i++) {
-        line[i] = be;
+    switch (event->id) {
+    case BTN_SELECT:
+        /* Cycle colors while LED is considered on */
+        s_ui.color = (led_color_t)((s_ui.color + 1) % LED_COLOR_COUNT);
+        if (s_ui.color == LED_COLOR_OFF) {
+            s_ui.color = LED_COLOR_RED;
+        }
+        s_ui.led_on = true;
+        ui_refresh_led();
+        break;
+
+    case BTN_SWITCH:
+        s_ui.led_on = !s_ui.led_on;
+        if (s_ui.led_on && s_ui.color == LED_COLOR_OFF) {
+            s_ui.color = LED_COLOR_RED;
+        }
+        ui_refresh_led();
+        break;
+
+    case BTN_BACK:
+        /* More obvious than only turning LED off */
+        s_ui.led_on = false;
+        s_ui.color = LED_COLOR_OFF;
+        led_set_rgb(40, 40, 40); /* brief dim white flash */
+        vTaskDelay(pdMS_TO_TICKS(80));
+        ui_refresh_led();
+        break;
+
+    default:
+        break;
     }
-
-    for (int y = 0; y < LCD_V_RES; y++) {
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel, 0, y, LCD_H_RES, y + 1, line));
-    }
-
-    heap_caps_free(line);
-}
-
-static esp_err_t app_lcd_init(void)
-{
-    backlight_init();
-
-    ESP_LOGI(TAG, "Init SPI bus");
-    const spi_bus_config_t buscfg = {
-        .sclk_io_num = PIN_LCD_SCLK,
-        .mosi_io_num = PIN_LCD_MOSI,
-        .miso_io_num = GPIO_NUM_NC,
-        .quadwp_io_num = GPIO_NUM_NC,
-        .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = LCD_H_RES * LCD_DRAW_BUFF_HEIGHT * sizeof(uint16_t),
-    };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO), TAG, "SPI init failed");
-
-    ESP_LOGI(TAG, "Install panel IO");
-    const esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = PIN_LCD_DC,
-        .cs_gpio_num = PIN_LCD_CS,
-        .pclk_hz = LCD_PIXEL_CLOCK_HZ,
-        .lcd_cmd_bits = LCD_CMD_BITS,
-        .lcd_param_bits = LCD_PARAM_BITS,
-        /* Rust/mipidsi required MODE_3 for this panel */
-        .spi_mode = 3,
-        .trans_queue_depth = 10,
-    };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST, &io_config, &lcd_io),
-                        TAG, "panel IO failed");
-
-    ESP_LOGI(TAG, "Install ST7789 driver");
-    const esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = LCD_BITS_PER_PIXEL,
-    };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(lcd_io, &panel_config, &lcd_panel), TAG, "ST7789 failed");
-
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(lcd_panel, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, false, false));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_panel, true));
-
-    backlight_on();
-
-    /* Bright red = hardware path works even if LVGL config is wrong */
-    ESP_LOGI(TAG, "Painting solid red test pattern");
-    lcd_fill_color(0xF800); /* RGB565 red */
-    vTaskDelay(pdMS_TO_TICKS(800));
-
-    ESP_LOGI(TAG, "LCD ready");
-    return ESP_OK;
-}
-
-static esp_err_t app_lvgl_init(void)
-{
-    const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), TAG, "lvgl_port_init failed");
-
-    const lvgl_port_display_cfg_t disp_cfg = {
-        .io_handle = lcd_io,
-        .panel_handle = lcd_panel,
-        .buffer_size = LCD_H_RES * LCD_DRAW_BUFF_HEIGHT,
-        .double_buffer = true,
-        .hres = LCD_H_RES,
-        .vres = LCD_V_RES,
-        .monochrome = false,
-        .color_format = LV_COLOR_FORMAT_RGB565,
-        .rotation = {
-            .swap_xy = false,
-            .mirror_x = false,
-            .mirror_y = false,
-        },
-        .flags = {
-            .buff_dma = true,
-            .swap_bytes = true,
-        },
-    };
-    lvgl_disp = lvgl_port_add_disp(&disp_cfg);
-    ESP_RETURN_ON_FALSE(lvgl_disp, ESP_FAIL, TAG, "lvgl_port_add_disp failed");
-
-    ESP_LOGI(TAG, "LVGL ready");
-    return ESP_OK;
 }
 
 static void app_create_ui(void)
 {
-    lvgl_port_lock(0);
+    display_lock(0);
 
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101820), 0);
 
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "cobox");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x000000), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -16);
+    s_ui.title = lv_label_create(scr);
+    lv_label_set_text(s_ui.title, "cobox test");
+    lv_obj_set_style_text_color(s_ui.title, lv_color_hex(0xE8F1F8), 0);
+    lv_obj_align(s_ui.title, LV_ALIGN_TOP_MID, 0, 12);
 
-    lv_obj_t *sub = lv_label_create(scr);
-    lv_label_set_text(sub, "LVGL + ST7789");
-    lv_obj_set_style_text_color(sub, lv_color_hex(0x333333), 0);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 20);
+    s_ui.led_label = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_ui.led_label, lv_color_hex(0x7CFFB2), 0);
+    lv_obj_align(s_ui.led_label, LV_ALIGN_TOP_MID, 0, 40);
 
-    lvgl_port_unlock();
+    s_ui.raw_label = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_ui.raw_label, lv_color_hex(0x8899AA), 0);
+    lv_obj_align(s_ui.raw_label, LV_ALIGN_TOP_MID, 0, 62);
+
+    for (int i = 0; i < BTN_COUNT; i++) {
+        s_ui.btn_labels[i] = lv_label_create(scr);
+        lv_obj_set_style_text_color(s_ui.btn_labels[i], lv_color_hex(0xC8D6E0), 0);
+        lv_obj_align(s_ui.btn_labels[i], LV_ALIGN_LEFT_MID, 24, -20 + (i * 28));
+    }
+
+    s_ui.hint = lv_label_create(scr);
+    lv_label_set_text(s_ui.hint,
+                      "Select: color\n"
+                      "Switch: on/off\n"
+                      "Back: LED off");
+    lv_obj_set_style_text_color(s_ui.hint, lv_color_hex(0x7AA2B8), 0);
+    lv_obj_set_style_text_align(s_ui.hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_ui.hint, LV_ALIGN_BOTTOM_MID, 0, -16);
+
+    display_unlock();
+
+    s_ui.color = LED_COLOR_OFF;
+    s_ui.led_on = false;
+    ui_refresh_led();
+    for (int i = 0; i < BTN_COUNT; i++) {
+        ui_refresh_button((button_id_t)i, false);
+    }
 }
 
 void app_main(void)
 {
-    ESP_ERROR_CHECK(app_lcd_init());
-    ESP_ERROR_CHECK(app_lvgl_init());
-    app_create_ui();
+    ESP_ERROR_CHECK(display_init());
+    ESP_ERROR_CHECK(led_init());
+    ESP_ERROR_CHECK(buttons_init());
 
-    ESP_LOGI(TAG, "UI running (BL on-level=%d)", LCD_BL_ON_LEVEL);
+    app_create_ui();
+    buttons_set_callback(on_button, NULL);
+    xTaskCreate(raw_monitor_task, "btn_raw", 2048, NULL, 3, NULL);
+
+    /* Startup LED blink so wiring is obvious */
+    led_set_color(LED_COLOR_RED);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    led_set_color(LED_COLOR_GREEN);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    led_set_color(LED_COLOR_BLUE);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    led_off();
+    ui_refresh_led();
+
+    ESP_LOGI(TAG, "UI test running");
 }
