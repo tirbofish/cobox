@@ -1,0 +1,3 @@
+# Keep flash/app sizes reasonable; enable larger fonts in menuconfig if needed
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_BUILD_DEMOS=n
