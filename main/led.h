@@ -20,13 +20,9 @@ typedef enum {
 } led_color_t;
 
 esp_err_t led_init(void);
-
-/** Set channel brightness 0–255. */
 esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b);
-
 esp_err_t led_set_color(led_color_t color);
 esp_err_t led_off(void);
-
 const char *led_color_name(led_color_t color);
 
 #ifdef __cplusplus
