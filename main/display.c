@@ -73,7 +73,6 @@ static void lcd_send_color(lv_display_t *disp, const uint8_t *cmd, size_t cmd_si
     while (xSemaphoreTake(s_color_done, 0) == pdTRUE) {
         /* drain stale gives */
     }
-    lv_draw_sw_rgb565_swap(param, param_size / 2);
     s_color_busy = true;
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(lcd_io, cmd[0], param, param_size));
 }
@@ -85,7 +84,7 @@ static esp_err_t lcd_hw_reset(void)
         .pin_bit_mask = 1ULL << PIN_LCD_RST,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&rst), TAG, "RST gpio failed");
-    gpio_set_level(PIN_LCD_RST, 0);
+    gpio_set_level(PIN_LCD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level(PIN_LCD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
