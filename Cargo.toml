@@ -23,12 +23,14 @@ esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
 
 [dependencies]
 log = "0.4"
+enumset = "1"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 embedded-hal = "1"
 embedded-graphics = "0.8"
 mipidsi = "0.10"
+wasmi = "0.31.2"
 
 [build-dependencies]
 embuild = "0.33"

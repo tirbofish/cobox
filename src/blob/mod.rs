@@ -13,6 +13,7 @@ use embedded_graphics::primitives::{Circle, Ellipse, PrimitiveStyle};
 
 use idle::SCALE_ONE;
 
+pub(crate) use config::random_u32;
 pub use config::{BlobConfig, Personality};
 
 pub const WIDTH: i32 = 128;
@@ -41,6 +42,7 @@ pub struct Blob {
     config: BlobConfig,
     born: Instant,
     pose: Pose,
+    expression: Option<(i32, i32)>,
     body: Box<Sprite>,
     frame: Box<Sprite>,
 }
@@ -55,6 +57,7 @@ impl Blob {
             config,
             born: Instant::now(),
             pose: Pose { bob: 0, blink: 0 },
+            expression: None,
             body: Box::new(Framebuffer::new()),
             frame: Box::new(Framebuffer::new()),
         };
@@ -75,13 +78,35 @@ impl Blob {
     }
 
     pub fn regenerate(&mut self) {
-        self.config = BlobConfig::new(shape::generate(), Personality::random());
+        self.config = self
+            .config
+            .with_random_shape()
+            .with_personality(Personality::random());
         self.reset();
     }
 
     pub fn randomize_personality(&mut self) {
         self.config = self.config.with_personality(Personality::random());
         self.reset();
+    }
+
+    pub fn set_expression_overlay(&mut self, bob_offset: i32, eye_scale: i32) -> bool {
+        let expression = (bob_offset, eye_scale);
+        if self.expression == Some(expression) {
+            return false;
+        }
+        self.expression = Some(expression);
+        self.render_frame();
+        true
+    }
+
+    pub fn clear_expression_overlay(&mut self) -> bool {
+        if self.expression.is_none() {
+            return false;
+        }
+        self.expression = None;
+        self.render_frame();
+        true
     }
 
     fn reset(&mut self) {
@@ -132,24 +157,26 @@ impl Blob {
 
     fn render_frame(&mut self) {
         self.frame.clear(background()).unwrap();
+        let (bob_offset, eye_scale) = self.expression.unwrap_or((0, 100));
+        let bob = self.pose.bob + bob_offset;
 
         let body = self.body.as_image();
-        Image::new(&body, Point::new(0, self.pose.bob))
+        Image::new(&body, Point::new(0, bob))
             .draw(&mut *self.frame)
             .unwrap();
 
         let eye = PrimitiveStyle::with_fill(rgb(0x10, 0x18, 0x20));
-        let eh = (16 * self.pose.blink as u32 / SCALE_ONE as u32).max(1);
+        let eh = (16 * self.pose.blink as u32 * eye_scale as u32 / SCALE_ONE as u32 / 100).max(1);
         let cy = HEIGHT / 2 - 2;
         Ellipse::with_center(
-            sprite_point(WIDTH / 2 - 16, cy) + Point::new(0, self.pose.bob),
+            sprite_point(WIDTH / 2 - 16, cy) + Point::new(0, bob),
             Size::new(10, eh),
         )
         .into_styled(eye)
         .draw(&mut *self.frame)
         .unwrap();
         Ellipse::with_center(
-            sprite_point(WIDTH / 2 + 16, cy) + Point::new(0, self.pose.bob),
+            sprite_point(WIDTH / 2 + 16, cy) + Point::new(0, bob),
             Size::new(10, eh),
         )
         .into_styled(eye)

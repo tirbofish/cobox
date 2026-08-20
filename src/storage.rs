@@ -11,8 +11,7 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
-    pub fn new() -> Result<Self, EspError> {
-        let partition = EspDefaultNvsPartition::take()?;
+    pub fn new(partition: EspDefaultNvsPartition) -> Result<Self, EspError> {
         let nvs = EspDefaultNvs::new(partition, NAMESPACE, true)?;
         Ok(Self { nvs })
     }

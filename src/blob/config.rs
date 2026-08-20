@@ -3,17 +3,22 @@ use super::{HEIGHT, WIDTH};
 pub const MAX_LOBES: usize = 15;
 pub const MIN_LOBES: usize = 9;
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const COLOR_LEN: usize = 3;
 const LOBE_LEN: usize = 3;
 const PERSONALITY_LEN: usize = 5;
+pub const NAME_LEN: usize = 16;
+pub const SPEECH_LEN: usize = 18;
 const VERSION_OFFSET: usize = 0;
 const LOBE_COUNT_OFFSET: usize = VERSION_OFFSET + 1;
 const COLOR_OFFSET: usize = LOBE_COUNT_OFFSET + 1;
 const LOBES_OFFSET: usize = COLOR_OFFSET + COLOR_LEN;
 const PERSONALITY_OFFSET: usize = LOBES_OFFSET + MAX_LOBES * LOBE_LEN;
-
-const BLOB_CONFIG_LEN: usize = PERSONALITY_OFFSET + PERSONALITY_LEN;
+const SETUP_OFFSET: usize = PERSONALITY_OFFSET + PERSONALITY_LEN;
+const BLOB_NAME_OFFSET: usize = SETUP_OFFSET + 1;
+const OWNER_NAME_OFFSET: usize = BLOB_NAME_OFFSET + NAME_LEN;
+const SPEECH_OFFSET: usize = OWNER_NAME_OFFSET + NAME_LEN;
+const BLOB_CONFIG_LEN: usize = SPEECH_OFFSET + SPEECH_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// User-adjustable traits in the inclusive `0..=MAX_VALUE` range.
@@ -56,13 +61,24 @@ impl Personality {
 pub struct BlobConfig {
     shape: ShapeConfig,
     personality: Personality,
+    is_setup: bool,
+    blob_name: [u8; NAME_LEN],
+    owner_name: [u8; NAME_LEN],
+    speech: [u8; SPEECH_LEN],
 }
 
 impl BlobConfig {
     pub const SERIALIZED_LEN: usize = BLOB_CONFIG_LEN;
 
     pub(crate) const fn new(shape: ShapeConfig, personality: Personality) -> Self {
-        Self { shape, personality }
+        Self {
+            shape,
+            personality,
+            is_setup: false,
+            blob_name: [0; NAME_LEN],
+            owner_name: [0; NAME_LEN],
+            speech: [0; SPEECH_LEN],
+        }
     }
 
     pub fn personality(self) -> Personality {
@@ -73,7 +89,26 @@ impl BlobConfig {
         Self {
             shape: self.shape,
             personality,
+            is_setup: self.is_setup,
+            blob_name: self.blob_name,
+            owner_name: self.owner_name,
+            speech: self.speech,
         }
+    }
+
+    pub(crate) fn with_random_shape(self) -> Self {
+        Self {
+            shape: super::shape::generate(),
+            ..self
+        }
+    }
+
+    pub fn is_setup(self) -> bool {
+        self.is_setup
+    }
+
+    pub fn speech(self) -> [u8; SPEECH_LEN] {
+        self.speech
     }
 
     pub fn serialize(self) -> [u8; BLOB_CONFIG_LEN] {
@@ -94,6 +129,10 @@ impl BlobConfig {
         bytes[PERSONALITY_OFFSET + 2] = self.personality.confidence;
         bytes[PERSONALITY_OFFSET + 3] = self.personality.playfulness;
         bytes[PERSONALITY_OFFSET + 4] = self.personality.sleepiness;
+        bytes[SETUP_OFFSET] = u8::from(self.is_setup);
+        bytes[BLOB_NAME_OFFSET..OWNER_NAME_OFFSET].copy_from_slice(&self.blob_name);
+        bytes[OWNER_NAME_OFFSET..SPEECH_OFFSET].copy_from_slice(&self.owner_name);
+        bytes[SPEECH_OFFSET..].copy_from_slice(&self.speech);
         bytes
     }
 
@@ -135,7 +174,32 @@ impl BlobConfig {
             return Err(BlobConfigError::InvalidPersonality);
         }
 
-        Ok(Self { shape, personality })
+        let is_setup = match bytes[SETUP_OFFSET] {
+            0 => false,
+            1 => true,
+            _ => return Err(BlobConfigError::InvalidSetup),
+        };
+        let mut blob_name = [0; NAME_LEN];
+        blob_name.copy_from_slice(&bytes[BLOB_NAME_OFFSET..OWNER_NAME_OFFSET]);
+        let mut owner_name = [0; NAME_LEN];
+        owner_name.copy_from_slice(&bytes[OWNER_NAME_OFFSET..SPEECH_OFFSET]);
+        let mut speech = [0; SPEECH_LEN];
+        speech.copy_from_slice(&bytes[SPEECH_OFFSET..]);
+        if !is_valid_text(&blob_name, is_setup)
+            || !is_valid_text(&owner_name, is_setup)
+            || !is_valid_text(&speech, false)
+        {
+            return Err(BlobConfigError::InvalidText);
+        }
+
+        Ok(Self {
+            shape,
+            personality,
+            is_setup,
+            blob_name,
+            owner_name,
+            speech,
+        })
     }
 
     pub(crate) const fn shape(self) -> ShapeConfig {
@@ -149,6 +213,21 @@ pub enum BlobConfigError {
     UnsupportedVersion,
     InvalidShape,
     InvalidPersonality,
+    InvalidSetup,
+    InvalidText,
+}
+
+fn is_valid_text(bytes: &[u8], required: bool) -> bool {
+    let mut terminated = false;
+    let mut length = 0;
+    for byte in bytes {
+        match *byte {
+            0 => terminated = true,
+            0x20..=0x7e if !terminated => length += 1,
+            _ => return false,
+        }
+    }
+    !required || length > 0
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
